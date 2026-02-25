@@ -1,11 +1,11 @@
 from airflow import DAG
 from airflow.decorators import task
+from airflow.models import Variable
 from datetime import datetime
 import requests
-import os
 import uuid
+import time
 from supabase import create_client
-
 
 DEFAULT_ARGS = {
     "owner": "airflow",
@@ -14,11 +14,10 @@ DEFAULT_ARGS = {
 
 BASE_URL = "https://bills-api.parliament.uk/api/v1"
 MAX_BILLS = 50
-MAX_PDFS = 100   # safety limit for downloads
 
 
 with DAG(
-    dag_id="uk_bills_full_ingestion",
+    dag_id="uk_bills_single_pdf_ingestion",
     default_args=DEFAULT_ARGS,
     start_date=datetime(2026, 1, 1),
     schedule_interval=None,
@@ -28,132 +27,183 @@ with DAG(
 
 
     # ---------------------------------------------------
-    # 1️⃣ Get Latest Bill IDs
+    # 1️⃣ Fetch Latest Bills (Pagination)
     # ---------------------------------------------------
     @task
-    def get_latest_bill_ids():
+    def get_latest_bills():
 
-        url = f"{BASE_URL}/Bills"
-        params = {
-            "SortOrder": "DateUpdatedDescending",
-            "Take": MAX_BILLS
-        }
+        all_bills = []
+        page = 1
+        page_size = 25
 
-        response = requests.get(url, params=params, timeout=20)
-        response.raise_for_status()
+        while len(all_bills) < MAX_BILLS:
 
-        data = response.json()
-        items = data.get("items", [])
+            url = f"{BASE_URL}/Bills"
+            params = {
+                "SortOrder": "DateUpdatedDescending",
+                "Page": page,
+                "Take": page_size
+            }
 
-        bill_ids = [bill["billId"] for bill in items[:MAX_BILLS]]
+            print(f"Fetching page {page}")
 
-        print(f"Processing {len(bill_ids)} bills:", bill_ids)
+            response = requests.get(url, params=params, timeout=20)
+            response.raise_for_status()
 
-        return bill_ids
+            items = response.json().get("items", [])
+
+            if not items:
+                break
+
+            all_bills.extend(items)
+            page += 1
+            time.sleep(0.2)
+
+        selected = all_bills[:MAX_BILLS]
+        print(f"Collected {len(selected)} bills")
+        return selected
 
 
     # ---------------------------------------------------
-    # 2️⃣ Fetch PDF URLs
+    # 2️⃣ Extract ONE Main PDF per Bill
+    # ---------------------------------------------------
+    # ---------------------------------------------------
+    # 2️⃣ Extract ONE Main PDF per Bill
     # ---------------------------------------------------
     @task
-    def fetch_pdf_urls(bill_ids):
+    def extract_main_pdf(bills):
 
-        all_pdf_urls = []
+        supabase_url = Variable.get("SUPABASE_URL")
+        supabase_key = Variable.get("SUPABASE_SERVICE_ROLE_KEY")
+        supabase = create_client(supabase_url, supabase_key)
 
-        for bill_id in bill_ids:
+        bill_pdf_list = []
+
+        for bill in bills:
+
+            bill_id = bill["billId"]
+
+            # 🔹 Skip already processed bills
+            existing = supabase.table("uk_bills_main") \
+                .select("bill_id") \
+                .eq("bill_id", bill_id) \
+                .execute()
+
+            if existing.data:
+                print(f"Skipping bill {bill_id} (already exists)")
+                continue
+
             try:
                 pub_url = f"{BASE_URL}/Bills/{bill_id}/Publications"
-                print(f"\nChecking bill {bill_id}")
-
                 response = requests.get(pub_url, timeout=20)
                 response.raise_for_status()
 
-                data = response.json()
-                publications = data.get("publications", [])
+                publications = response.json().get("publications", [])
 
+                main_pdf_url = None
+
+                # 🔹 Take ONLY FIRST PDF found
                 for pub in publications:
-
-                    # Extract from links
-                    for link in pub.get("links", []):
-                        if link.get("contentType") == "application/pdf":
-                            pdf_url = link.get("url")
-                            if pdf_url:
-                                all_pdf_urls.append(pdf_url)
-
-                    # Extract from files
                     for file in pub.get("files", []):
                         if file.get("contentType") == "application/pdf":
+
                             publication_id = pub.get("id")
                             document_id = file.get("id")
 
                             if publication_id and document_id:
-                                file_url = (
+                                main_pdf_url = (
                                     f"{BASE_URL}/Publications/"
                                     f"{publication_id}/Documents/"
                                     f"{document_id}/Download"
                                 )
-                                all_pdf_urls.append(file_url)
+                                break
+                    if main_pdf_url:
+                        break
+
+                if main_pdf_url:
+                    bill_pdf_list.append({
+                        "bill": bill,
+                        "pdf_url": main_pdf_url
+                    })
+
+                time.sleep(0.2)
 
             except Exception as e:
-                print(f"Error processing bill {bill_id}: {e}")
+                print(f"Error for bill {bill_id}: {e}")
 
-        print(f"\nTotal PDFs found: {len(all_pdf_urls)}")
+        print(f"New bills with PDFs: {len(bill_pdf_list)}")
+        return bill_pdf_list
 
-        return all_pdf_urls
 
 
     # ---------------------------------------------------
-    # 3️⃣ Download & Upload to Supabase
+    # 3️⃣ Upload PDF + Store Metadata
     # ---------------------------------------------------
     @task
-    def download_and_store_pdfs(pdf_urls):
-        from airflow.models import Variable
+    def upload_and_store(bill_pdf_list):
+
         supabase_url = Variable.get("SUPABASE_URL")
         supabase_key = Variable.get("SUPABASE_SERVICE_ROLE_KEY")
-
-        if not supabase_url or not supabase_key:
-            raise Exception("Supabase credentials missing")
-
         supabase = create_client(supabase_url, supabase_key)
+
         bucket_name = "legislative-pdfs"
+        processed = 0
 
-        stored_files = []
+        for item in bill_pdf_list:
 
-        for url in pdf_urls[:MAX_PDFS]:   # safety limit
+            bill = item["bill"]
+            pdf_url = item["pdf_url"]
+            bill_id = bill["billId"]
+
             try:
-                print(f"\nDownloading: {url}")
+                print(f"Downloading bill {bill_id}")
 
-                response = requests.get(url, timeout=40)
-                response.raise_for_status()
+                pdf_response = requests.get(pdf_url, timeout=40)
+                pdf_response.raise_for_status()
 
-                file_name = f"{uuid.uuid4()}.pdf"
+                # 🔥 CLEAN BILL TITLE FOR FILENAME
+                raw_title = bill.get("shortTitle", f"bill_{bill_id}")
+                safe_title = "".join(
+                    c for c in raw_title if c.isalnum() or c in (" ", "_")
+                ).strip().replace(" ", "_")
+
+                file_name = f"{safe_title}.pdf"
                 file_path = f"uk_bills/{file_name}"
 
                 supabase.storage.from_(bucket_name).upload(
                     file_path,
-                    response.content,
+                    pdf_response.content,
                     {"content-type": "application/pdf"}
                 )
 
                 public_url = supabase.storage.from_(bucket_name).get_public_url(file_path)
 
-                stored_files.append({
-                    "original_url": url,
-                    "storage_path": file_path,
-                    "public_url": public_url
-                })
+                supabase.table("uk_bills_main").upsert(
+                    {
+                        "bill_id": bill_id,
+                        "title": bill.get("shortTitle"),
+                        "long_title": bill.get("longTitle"),
+                        "introduced_date": bill.get("introducedDate"),
+                        "current_stage": bill.get("currentStage", {}).get("stage"),
+                        "sponsor": bill.get("sponsors", [{}])[0].get("name"),
+                        "pdf_storage_path": file_path,
+                        "pdf_public_url": public_url
+                    },
+                    on_conflict="bill_id"
+                ).execute()
 
-                print(f"Uploaded → {file_path}")
+                processed += 1
+                print(f"Stored: {file_name}")
+
+                time.sleep(0.2)
 
             except Exception as e:
-                print(f"Failed for {url}: {e}")
+                print(f"Error processing bill {bill_id}: {e}")
 
-        print(f"\nTotal uploaded: {len(stored_files)}")
-
-        return stored_files
+        print(f"Total processed: {processed}")
 
 
     # DAG FLOW
-    bill_ids = get_latest_bill_ids()
-    pdf_urls = fetch_pdf_urls(bill_ids)
-    download_and_store_pdfs(pdf_urls)
+    bills = get_latest_bills()
+    bill_pdf_list = extract_main_pdf(bills)
+    upload_and_store(bill_pdf_list)
