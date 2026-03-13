@@ -7,9 +7,8 @@ import time
 from supabase import create_client
 from io import BytesIO
 import pdfplumber
-import google.generativeai as genai
 from groq import Groq
-from sentence_transformers import SentenceTransformer
+
 
 DEFAULT_ARGS = {
     "owner": "airflow",
@@ -244,78 +243,13 @@ with DAG(
                 print(f"Error extracting {bill_id}: {e}")
 
     # ---------------------------------------------------
-    # 5️⃣ Generate Summary Using Gemini
+    # 5️⃣ Generate Summary 
     # ---------------------------------------------------
     @task
     def generate_summary():
 
-        genai.configure(
-            api_key=Variable.get("GEMINI_API_KEY")
-        )
-
-        model = genai.GenerativeModel("gemini-2.5-flash")
-
-        supabase = create_client(
-            Variable.get("SUPABASE_URL"),
-            Variable.get("SUPABASE_SERVICE_ROLE_KEY")
-        )
-
-        bills = supabase.table("uk_bills_main") \
-            .select("bill_id, full_text") \
-            .eq("text_extracted", True) \
-            .is_("summary", None) \
-            .limit(5) \
-            .execute()
-
-        if not bills.data:
-            print("No bills pending summarization.")
-            return
-
-        for bill in bills.data:
-
-            bill_id = bill["bill_id"]
-            full_text = bill["full_text"]
-
-            if not full_text or len(full_text.strip()) == 0:
-                print(f"Skipping empty text for bill {bill_id}")
-                continue
-
-            try:
-                trimmed_text = full_text[:12000]
-
-                prompt = f"""
-                You are a legal policy analyst.
-
-                Summarize this UK Parliament bill in simple, plain English.
-
-                Provide:
-                1. Short Summary (5–7 lines)
-                2. Key Changes (bullet points)
-                3. Who Is Affected
-                4. Business Impact
-                5. Important Dates (if mentioned)
-
-                Bill Text:
-                {trimmed_text}
-                """
-
-                response = model.generate_content(prompt)
-                summary = response.text.strip()
-
-                supabase.table("uk_bills_main").update(
-                    {"summary": summary}
-                ).eq("bill_id", bill_id).execute()
-
-                print(f"Summary generated for bill {bill_id}")
-
-                time.sleep(2)
-
-            except Exception as e:
-                print(f"Gemini failed for {bill_id}: {e}")
-                continue
-
-    @task
-    def generate_summary_groq():
+        from groq import Groq
+        import time
 
         client = Groq(
             api_key=Variable.get("GROQ_API_KEY")
@@ -330,19 +264,22 @@ with DAG(
             .select("bill_id, full_text") \
             .eq("text_extracted", True) \
             .is_("summary", None) \
-            .limit(10) \
+            .limit(20) \
             .execute()
 
         if not bills.data:
-            print("No bills pending Groq summarization.")
+            print("No bills pending summarization.")
             return
+
+        print(f"Generating summaries for {len(bills.data)} bills")
 
         for bill in bills.data:
 
             bill_id = bill["bill_id"]
             full_text = bill["full_text"]
 
-            if not full_text:
+            if not full_text or len(full_text.strip()) == 0:
+                print(f"Skipping empty text for bill {bill_id}")
                 continue
 
             try:
@@ -353,18 +290,22 @@ with DAG(
                     messages=[
                         {
                             "role": "system",
-                            "content": "You are a legal policy analyst."
+                            "content": (
+                                "You are a UK legal policy analyst. "
+                                "Summarize legislation clearly for business leaders."
+                            )
                         },
                         {
                             "role": "user",
                             "content": f"""
                             Summarize this UK Parliament bill in plain English.
 
-                            Focus on:
-                            - What changed
-                            - Who is affected
-                            - Business impact
-                            - Important dates
+                            Provide:
+                            1. Short Overview (5–7 lines)
+                            2. Key Changes (bullet points)
+                            3. Who Is Affected
+                            4. Business Impact
+                            5. Important Dates (if mentioned)
 
                             Bill Text:
                             {trimmed_text}
@@ -380,12 +321,19 @@ with DAG(
                     {"summary": summary}
                 ).eq("bill_id", bill_id).execute()
 
-                print(f"Groq summary generated for bill {bill_id}")
+                print(f"Summary stored for bill {bill_id}")
 
                 time.sleep(2)
 
             except Exception as e:
-                print(f"Groq failed for {bill_id}: {e}")
+                error_message = str(e)
+
+                if "429" in error_message:
+                    print("Groq rate limit hit. Sleeping 10 seconds...")
+                    time.sleep(10)
+                    continue
+
+                print(f"Groq summary failed for {bill_id}: {e}")
                 continue
 
     @task
@@ -530,8 +478,7 @@ with DAG(
     stored = upload_and_store(pdfs)
     text = extract_pdf_text()
     summary = generate_summary()
-    groq_summary = generate_summary_groq()
     tags = generate_industry_tags()
     embeddings = generate_embeddings()
 
-    bills >> pdfs >> stored >> text >> summary >> groq_summary >> tags >> embeddings
+    bills >> pdfs >> stored >> text >> summary >> tags >> embeddings
