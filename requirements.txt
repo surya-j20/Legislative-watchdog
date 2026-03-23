@@ -6,3 +6,4 @@ streamlit
 supabase
 requests
 python-dotenv
+groq
