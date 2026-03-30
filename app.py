@@ -19,10 +19,20 @@ st.set_page_config(
 
 @st.cache_resource
 def get_supabase():
-    url = st.secrets.get("SUPABASE_URL") or os.environ.get("SUPABASE_URL")
-    key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    try:
+        url = st.secrets.get("SUPABASE_URL")
+    except Exception:
+        url = None
+    url = url or os.environ.get("SUPABASE_URL")
+
+    try:
+        key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
+    except Exception:
+        key = None
+    key = key or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
     if not url or not key:
-        st.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in secrets.")
+        st.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY.")
         st.stop()
     return create_client(url, key)
 
