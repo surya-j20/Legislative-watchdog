@@ -19,32 +19,25 @@ st.set_page_config(
 
 @st.cache_resource
 def get_supabase():
-    try:
-        url = st.secrets.get("SUPABASE_URL")
-    except Exception:
-        url = None
-    url = url or os.environ.get("SUPABASE_URL")
-
-    try:
-        key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
-    except Exception:
-        key = None
-    key = key or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
     if not url or not key:
         st.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY.")
         st.stop()
+
     return create_client(url, key)
+
 
 @st.cache_resource
 def get_groq():
-    api_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+    api_key = os.environ.get("GROQ_API_KEY")
+
     if not api_key:
-        st.error("Missing GROQ_API_KEY in secrets.")
+        st.error("Missing GROQ_API_KEY.")
         st.stop()
+
     return Groq(api_key=api_key)
-
-
 # ─────────────────────────────────────────────
 # STYLES
 # ─────────────────────────────────────────────
